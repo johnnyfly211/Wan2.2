@@ -11,7 +11,7 @@ try:
     import moviepy.editor as mpy
 except:
     import moviepy as mpy
-
+from transformers import AutoTokenizer, T5Tokenizer
 from decord import VideoReader
 from pose2d import Pose2d
 from pose2d_utils import AAPoseMeta
@@ -29,11 +29,28 @@ class ProcessPipeline():
     def __init__(self, det_checkpoint_path, pose2d_checkpoint_path, sam_checkpoint_path, flux_kontext_path):
         self.pose2d = Pose2d(checkpoint=pose2d_checkpoint_path, detector_checkpoint=det_checkpoint_path)
 
+        # --- SAM2 predictor must be created before use ---
         model_cfg = "sam2_hiera_l.yaml"
-        if sam_checkpoint_path is not None:
-            self.predictor = build_sam2_video_predictor(model_cfg, sam_checkpoint_path)
+        if sam_checkpoint_path is None or not os.path.exists(sam_checkpoint_path):
+            raise ValueError(f"SAM2 checkpoint path is missing or invalid: {sam_checkpoint_path}")
+        self.predictor = build_sam2_video_predictor(model_cfg, sam_checkpoint_path)
+
+        # --- FluxKontext pipeline with SLOW tokenizer (SentencePiece) ---
         if flux_kontext_path is not None:
-            self.flux_kontext = FluxKontextPipeline.from_pretrained(flux_kontext_path, torch_dtype=torch.bfloat16).to("cuda")
+            tok_dir = os.path.join(flux_kontext_path, "tokenizer_2")
+            spm_path = os.path.join(tok_dir, "spiece.model")
+            # explicit slow tokenizer object; matches pipeline’s expected PreTrainedTokenizer
+            self.flux_tokenizer = T5Tokenizer(vocab_file=spm_path)
+
+            self.flux_kontext = FluxKontextPipeline.from_pretrained(
+                flux_kontext_path,
+                torch_dtype=torch.bfloat16,
+                tokenizer=self.flux_tokenizer,
+                local_files_only=True,
+            ).to("cuda")
+        else:
+            self.flux_kontext = None
+
 
     def __call__(self, video_path, refer_image_path, output_path, resolution_area=[1280, 720], fps=30, iterations=3, k=7, w_len=1, h_len=1, retarget_flag=False, use_flux=False, replace_flag=False):
         if replace_flag:
@@ -94,7 +111,7 @@ class ProcessPipeline():
                 canvas = np.zeros_like(refer_img)
                 conditioning_image = draw_aapose_by_meta_new(canvas, meta)
                 cond_images.append(conditioning_image)
-            masks = self.get_mask(frames, 400, tpl_pose_metas)
+            masks = self.get_mask(frames, 400, tpl_pose_metas, video_path=video_path)
 
             bg_images = []
             aug_masks = []
@@ -277,7 +294,7 @@ class ProcessPipeline():
         return tpl_prompt, refer_prompt
     
 
-    def get_mask(self, frames, th_step, kp2ds_all):
+    def get_mask(self, frames, th_step, kp2ds_all, video_path=None):
         frame_num = len(frames)
         if frame_num < th_step:
             num_step = 1
@@ -315,18 +332,54 @@ class ProcessPipeline():
                 points = (keypoints_body * wh).astype(np.int32)
                 key_frame_body_points_list.append(points)
 
-            inference_state = self.predictor.init_state_v2(frames=each_frames)
-            self.predictor.reset_state(inference_state)
+            # --- make sure predictor exists ---
+            if not hasattr(self, "predictor") or self.predictor is None:
+                raise RuntimeError("SAM2 predictor is not initialized.")
+
+            # --- initialize SAM2 state; track which API we used ---
+            used_video_path_api = False
+            if hasattr(self.predictor, "init_state_v2"):
+                # Newer API supports in-memory frames
+                inference_state = self.predictor.init_state_v2(frames=each_frames)
+            else:
+                if not hasattr(self.predictor, "init_state"):
+                    raise RuntimeError("Unsupported SAM2 predictor: neither init_state nor init_state_v2 is available.")
+                if video_path is None:
+                    raise TypeError("This SAM2 build requires init_state(video_path=...), but no video_path was provided.")
+                inference_state = self.predictor.init_state(video_path=video_path)
+                used_video_path_api = True  # frame_idx must be absolute for this path
+                
+            # --- ensure fresh tracking structures exist (older SAM2 expects these) ---
+            if isinstance(inference_state, dict):
+                inference_state.setdefault("frames_tracked_per_obj", {})  # <- prevents KeyError in _obj_id_to_idx
+                inference_state.setdefault("obj_id_to_idx", {})
+                inference_state.setdefault("obj_idx_to_id", {})
+
+
+            # --- ensure tracking dicts exist (older API populates them via reset_state) ---
+            if hasattr(self.predictor, "reset_state"):
+                # Only call when the key is missing
+                if not (isinstance(inference_state, dict) and "frames_tracked_per_obj" in inference_state):
+                    # Only reset if this state already contains tracking maps (i.e., we're reusing it)
+                    if hasattr(self.predictor, "reset_state") and isinstance(inference_state, dict) and "frames_tracked_per_obj" in inference_state:
+                        self.predictor.reset_state(inference_state)
+
+
+            # --- add sparse points on key frames ---
             ann_obj_id = 1
+            base_idx = index * th_step if used_video_path_api else 0  # absolute offset when using video_path
             for ann_frame_idx, points in zip(key_frame_index_list, key_frame_body_points_list):
                 labels = np.array([1] * points.shape[0], np.int32)
+                frame_idx_for_api = base_idx + ann_frame_idx if used_video_path_api else ann_frame_idx
+
                 _, out_obj_ids, out_mask_logits = self.predictor.add_new_points(
                     inference_state=inference_state,
-                    frame_idx=ann_frame_idx,
+                    frame_idx=frame_idx_for_api,
                     obj_id=ann_obj_id,
                     points=points,
                     labels=labels,
                 )
+
 
             video_segments = {}
             for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(inference_state):

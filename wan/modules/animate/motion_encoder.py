@@ -6,11 +6,17 @@ from torch.nn import functional as F
 import math
 
 def custom_qr(input_tensor):
-    original_dtype = input_tensor.dtype
-    if original_dtype == torch.bfloat16:
-        q, r = torch.linalg.qr(input_tensor.to(torch.float32))
-        return q.to(original_dtype), r.to(original_dtype)
-    return torch.linalg.qr(input_tensor)
+    # cuSOLVER can be flaky on Windows; try GPU first, then fall back.
+    x = input_tensor.to(torch.float32)
+    device = x.device
+    try:
+        # Try GPU QR (will use cuSOLVER or MAGMA depending on backend pref)
+        q, r = torch.linalg.qr(x)
+    except RuntimeError:
+        # Fallback to CPU LAPACK, then move results back to GPU
+        q_cpu, r_cpu = torch.linalg.qr(x.cpu())
+        q, r = q_cpu.to(device), r_cpu.to(device)
+    return q, r
 
 def fused_leaky_relu(input, bias, negative_slope=0.2, scale=2 ** 0.5):
 	return F.leaky_relu(input + bias, negative_slope) * scale
@@ -302,6 +308,6 @@ class Generator(nn.Module):
     def get_motion(self, img):
         #motion_feat = self.enc.enc_motion(img)
         motion_feat = torch.utils.checkpoint.checkpoint((self.enc.enc_motion), img, use_reentrant=True)
-        with torch.cuda.amp.autocast(dtype=torch.float32):
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             motion = self.dec.direction(motion_feat)
         return motion

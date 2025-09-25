@@ -45,7 +45,7 @@ class HeadAnimate(Head):
             e(Tensor): Shape [B, L1, C]
         """
         assert e.dtype == torch.float32
-        with amp.autocast(dtype=torch.float32):
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
             x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
         return x
@@ -204,7 +204,7 @@ class WanAnimateAttentionBlock(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         assert e.dtype == torch.float32
-        with amp.autocast(dtype=torch.float32):
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             e = (self.modulation + e).chunk(6, dim=1)
         assert e[0].dtype == torch.float32
 
@@ -212,14 +212,14 @@ class WanAnimateAttentionBlock(nn.Module):
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes, freqs
         )
-        with amp.autocast(dtype=torch.float32):
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             x = x + y * e[2]
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
-            with amp.autocast(dtype=torch.float32):
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 x = x + y * e[5]
             return x
 
@@ -403,12 +403,15 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         ])
 
         # time embeddings
-        with amp.autocast(dtype=torch.float32):
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             e = self.time_embedding(
                 sinusoidal_embedding_1d(self.freq_dim, t).float()
             )
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+            if e.dtype != torch.float32:
+                e = e.float()
+            if e0.dtype != torch.float32:
+                e0 = e0.float()
 
         # context
         context_lens = None
